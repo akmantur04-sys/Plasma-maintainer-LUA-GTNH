@@ -113,25 +113,39 @@ local activeCraft = nil      -- { request, entry, startTime }
 local failCooldowns = {}     -- label -> timestamp
 local recentlyCrafted = {}   -- label -> true (cleared each cycle)
 
+-- Get CPU status summary for diagnostic messages
+local function getCpuStatus()
+  local ok, cpus = pcall(me.getCpus)
+  if not ok or not cpus then return "CPUs: unknown" end
+  local busy, total = 0, #cpus
+  for _, cpu in ipairs(cpus) do if cpu.busy then busy = busy + 1 end end
+  return string.format("CPUs: %d/%d busy", busy, total)
+end
+
 -- Clears activeCraft with logging and sets recentlyCrafted
 local function finishCraft(msg, color, setCooldown)
   local label = activeCraft.entry.label
-  log(msg .. label, color)
+  local elapsed = os.time() - activeCraft.startTime
+  log(msg .. label .. " (after " .. elapsed .. "s)", color)
   recentlyCrafted[label] = true
-  if setCooldown then failCooldowns[label] = os.time() + CONFIG.failCooldown end
+  if setCooldown then
+    failCooldowns[label] = os.time() + CONFIG.failCooldown
+    log("  ⏸ Cooldown set: " .. CONFIG.failCooldown .. "s before retry", C.mag)
+  end
   activeCraft = nil
 end
 
 local function isAnyCraftActive()
   if not activeCraft then return false end
   local req = activeCraft.request
+  local elapsed = os.time() - activeCraft.startTime
 
   if req.isDone()     then finishCraft("✓ Craft done: ", C.grn, false)  return false end
-  if req.isCanceled() then finishCraft("✗ Craft canceled: ", C.red, false) return false end
-  if req.hasFailed()  then finishCraft("✗ Craft failed: ", C.red, true) return false end
+  if req.isCanceled() then finishCraft("✗ Craft canceled (by player or AE2): ", C.red, false) return false end
+  if req.hasFailed()  then finishCraft("✗ Craft failed (ingredients missing or unavailable): ", C.red, true) return false end
 
-  if os.time() - activeCraft.startTime > CONFIG.craftTimeout then
-    finishCraft("✗ Craft timeout: ", C.red, true)
+  if elapsed > CONFIG.craftTimeout then
+    finishCraft("✗ Craft timeout (" .. CONFIG.craftTimeout .. "s limit): ", C.red, true)
     return false
   end
   return true
@@ -155,15 +169,17 @@ end
 -- Request a craft from AE2
 local function requestCraft(entry, craftable, deficit)
   local amount = math.min(entry.batch or 1, deficit)
-  log("→ Starting craft: " .. amount .. "x " .. entry.label ..
-      " (Prio " .. (entry.priority or "?") .. ")", C.cyn)
+  local cpuInfo = getCpuStatus()
+  log("→ Requesting craft: " .. amount .. "x " .. entry.label ..
+      " (Prio " .. (entry.priority or "?") .. ") [" .. cpuInfo .. "]", C.cyn)
 
   local req = CONFIG.cpuName
     and craftable.request(amount, CONFIG.prioritizePower, CONFIG.cpuName)
     or  craftable.request(amount, CONFIG.prioritizePower)
 
   if not req then
-    log("✗ Craft request failed for: " .. entry.label, C.red)
+    log("✗ Craft request returned nil: " .. entry.label .. " [" .. cpuInfo .. "]", C.red)
+    log("  Possible causes: no free crafting CPU, pattern broken, or AE2 error", C.red)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
@@ -171,25 +187,30 @@ local function requestCraft(entry, craftable, deficit)
   os.sleep(0.5) -- let AE2 process
 
   if req.hasFailed() then
-    log("⚠ Craft failed immediately (missing ingredients?): " .. entry.label, C.yel)
+    log("⚠ Craft failed immediately: " .. entry.label .. " [" .. cpuInfo .. "]", C.yel)
+    log("  Possible causes: missing ingredients, no free CPU, or circular dependency", C.yel)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
   if req.isCanceled() then
-    log("⚠ Craft canceled immediately: " .. entry.label, C.yel)
+    log("⚠ Craft canceled immediately: " .. entry.label .. " [" .. cpuInfo .. "]", C.yel)
+    log("  Possible causes: CPU taken by another craft, or AE2 rejected the request", C.yel)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
 
   activeCraft = { request = req, entry = entry, startTime = os.time() }
+  log("  ✓ Craft accepted by AE2, monitoring...", C.grn)
   return true
 end
 
 -- Main check: iterate by priority, start one craft if needed
 local function checkAndMaintain()
   if isAnyCraftActive() then
+    local elapsed = os.time() - activeCraft.startTime
     log("⏳ Craft running: " .. activeCraft.entry.label ..
-        " (Prio " .. (activeCraft.entry.priority or "?") .. ")", C.yel)
+        " (Prio " .. (activeCraft.entry.priority or "?") ..
+        ", " .. elapsed .. "s elapsed)", C.yel)
     return false
   end
 
@@ -210,11 +231,12 @@ local function checkAndMaintain()
       allFull = false
       local cd = failCooldowns[entry.label]
       if cd and os.time() < cd then
-        log("  ⏸ Cooldown active for: " .. entry.label, C.mag)
+        local remaining = cd - os.time()
+        log("  ⏸ Cooldown: " .. entry.label .. " (" .. remaining .. "s remaining)", C.mag)
       elseif recentlyCrafted[entry.label] then
-        log("  ⏸ Just crafted, waiting for stock update: " .. entry.label, C.mag)
+        log("  ⏸ Waiting for stock update: " .. entry.label .. " (crafted this cycle)", C.mag)
       elseif isCraftAlreadyRunning(entry) then
-        log("  ⏳ Craft already running (AE2): " .. entry.label, C.yel)
+        log("  ⏳ Already crafting on AE2 CPU: " .. entry.label, C.yel)
       else
         failCooldowns[entry.label] = nil
         local craftable = getCraftable(entry)
@@ -222,7 +244,8 @@ local function checkAndMaintain()
           if requestCraft(entry, craftable, deficit) then return false end
           log("  ↓ Trying next priority...", C.yel)
         else
-          log("⚠ No pattern found for: " .. entry.label, C.yel)
+          log("⚠ No craftable pattern found for: " .. entry.label ..
+              " (check AE2 patterns & Fluid Discretizer)", C.yel)
         end
       end
     end
