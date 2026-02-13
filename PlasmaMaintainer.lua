@@ -225,7 +225,7 @@ local function printStatusBar(status, cpuTotal, cpuBusy)
     if pct >= 100 then
       bar = bar .. "  ✓"
     else
-      bar = bar .. string.format(" %3d%%", math.floor(pct))
+      bar = bar .. string.format(" %.0f%%", pct)
     end
     print(bar .. C.R)
   end
