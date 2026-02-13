@@ -312,6 +312,11 @@ local activeCraft = nil  -- { request = ..., entry = ..., startTime = ... }
 -- Cooldown tracker: label -> timestamp when retry is allowed
 local failCooldowns = {}
 
+-- Recently crafted tracker: label -> true
+-- Prevents re-queuing the same plasma before AE2 has updated stock levels.
+-- Cleared at the start of each check cycle.
+local recentlyCrafted = {}
+
 local function isAnyCraftActive()
   if activeCraft == nil then
     return false
@@ -322,12 +327,14 @@ local function isAnyCraftActive()
   -- Check if craft is done or failed
   if req.isDone() then
     log("✓ Craft done: " .. activeCraft.entry.label, colors.green)
+    recentlyCrafted[activeCraft.entry.label] = true
     activeCraft = nil
     return false
   end
 
   if req.isCanceled() then
     log("✗ Craft canceled: " .. activeCraft.entry.label, colors.red)
+    recentlyCrafted[activeCraft.entry.label] = true
     activeCraft = nil
     return false
   end
@@ -336,6 +343,7 @@ local function isAnyCraftActive()
     log("✗ Craft failed: " .. activeCraft.entry.label, colors.red)
     -- Set cooldown to avoid immediate retry
     failCooldowns[activeCraft.entry.label] = os.time() + CONFIG.failCooldown
+    recentlyCrafted[activeCraft.entry.label] = true
     activeCraft = nil
     return false
   end
@@ -449,6 +457,10 @@ local function checkAndMaintain()
     return false
   end
 
+  -- Clear recentlyCrafted at the start of each full check cycle.
+  -- This ensures we re-read stock levels before re-queuing the same plasma.
+  recentlyCrafted = {}
+
   local allFull = true
 
   -- Iterate stockList by priority
@@ -477,16 +489,21 @@ local function checkAndMaintain()
       local cooldownUntil = failCooldowns[entry.label]
       if cooldownUntil and os.time() < cooldownUntil then
         log("  ⏸ Cooldown active for: " .. entry.label, colors.magenta)
-        -- Don't break → continue to next priority!
         goto continue
       end
       -- Cooldown expired, clear it
       failCooldowns[entry.label] = nil
 
+      -- Check if we just finished a craft for this plasma in this cycle.
+      -- Wait for the next cycle so AE2 stock levels are up to date.
+      if recentlyCrafted[entry.label] then
+        log("  ⏸ Just crafted, waiting for stock update: " .. entry.label, colors.magenta)
+        goto continue
+      end
+
       -- Check if an AE2 craft is already running for this item
       if isCraftAlreadyRunning(entry) then
         log("  ⏳ Craft already running (AE2): " .. entry.label, colors.yellow)
-        -- Don't break → continue to next priority!
         goto continue
       end
 
