@@ -50,7 +50,7 @@ end
 local function fmtAmt(n)
   if n >= 1e6 then return string.format("%.1fM", n / 1e6)
   elseif n >= 1000 then return string.format("%.1fK", n / 1000)
-  else return string.format("%d", n) end
+  else return string.format("%.0f", n) end
 end
 
 -- Label helpers
@@ -217,8 +217,8 @@ local function printStatusBar(status, cpuTotal, cpuBusy)
   for _, s in ipairs(status) do
     local pct = s.target > 0 and (s.stored / s.target * 100) or 100
     local col = pct >= 100 and C.grn or (pct >= 50 and C.yel or C.red)
-    local bar = col .. string.format(" P%-3d %-22s %8s / %-8s",
-        s.entry.priority or 0, s.entry.label,
+    local bar = col .. string.format(" P%-3s %-22s %8s / %-8s",
+        tostring(s.entry.priority or 0), s.entry.label,
         fmtAmt(s.stored), fmtAmt(s.target))
 
     -- Show percentage or checkmark
@@ -352,8 +352,8 @@ local function scanMode()
       print(string.format("  %-35s %-30s %-8s %-10s %-10s", "Label", "Name", "Dmg", "Amount", "Craft?"))
       print("  " .. string.rep("-", 95))
       for _, i in ipairs(r) do
-        print(string.format("  %-35s %-30s %-8d %-10s %-10s", i.label or "?", i.name or "?",
-            i.damage or 0, fmtAmt(i.size or 0), i.isCraftable and "Yes" or "No"))
+        print(string.format("  %-35s %-30s %-8s %-10s %-10s", i.label or "?", i.name or "?",
+            tostring(i.damage or 0), fmtAmt(i.size or 0), i.isCraftable and "Yes" or "No"))
       end
     end)
 
