@@ -174,15 +174,7 @@ end
 -- Request a craft from AE2
 local function requestCraft(entry, craftable, deficit)
   local amount = math.min(entry.batch or 1, deficit)
-  local total, busy = getCpuInfo()
-  local cpuInfo = string.format("CPUs: %d/%d busy", busy, total)
-
-  -- Pre-check: are any CPUs free?
-  if total > 0 and busy >= total then
-    log("⚠ All crafting CPUs busy, skipping: " .. entry.label .. " [" .. cpuInfo .. "]", C.yel)
-    return false  -- no cooldown — retry next cycle when a CPU might be free
-  end
-
+  local cpuInfo = getCpuStatus()
   log("→ Requesting craft: " .. amount .. "x " .. entry.label ..
       " (Prio " .. (entry.priority or "?") .. ") [" .. cpuInfo .. "]", C.cyn)
 
@@ -226,6 +218,10 @@ local function checkAndMaintain()
     return false
   end
 
+  -- Early exit: check if any crafting CPU is free before scanning stock
+  local total, busy = getCpuInfo()
+  local noCpuFree = total > 0 and busy >= total
+
   local allFull = true
   for _, entry in ipairs(stockList) do
     local stored = getStoredAmount(entry)
@@ -241,31 +237,38 @@ local function checkAndMaintain()
 
     if deficit > 0 then
       allFull = false
-      local cd = failCooldowns[entry.label]
-      if cd and os.time() < cd then
-        local remaining = cd - os.time()
-        log("  ⏸ Cooldown: " .. entry.label .. " (" .. remaining .. "s remaining)", C.mag)
-      elseif recentlyCrafted[entry.label] then
-        log("  ⏸ Waiting for stock update: " .. entry.label .. " (crafted this cycle)", C.mag)
-      elseif isCraftAlreadyRunning(entry) then
-        log("  ⏳ Already crafting on AE2 CPU: " .. entry.label, C.yel)
-      else
-        failCooldowns[entry.label] = nil
-        local craftable = getCraftable(entry)
-        if craftable then
-          if requestCraft(entry, craftable, deficit) then return false end
-          log("  ↓ Trying next priority...", C.yel)
+
+      if not noCpuFree then
+        local cd = failCooldowns[entry.label]
+        if cd and os.time() < cd then
+          local remaining = cd - os.time()
+          log("  ⏸ Cooldown: " .. entry.label .. " (" .. remaining .. "s remaining)", C.mag)
+        elseif recentlyCrafted[entry.label] then
+          log("  ⏸ Waiting for stock update: " .. entry.label .. " (crafted this cycle)", C.mag)
+        elseif isCraftAlreadyRunning(entry) then
+          log("  ⏳ Already crafting on AE2 CPU: " .. entry.label, C.yel)
         else
-          log("⚠ No craftable pattern found for: " .. entry.label ..
-              " (check AE2 patterns & Fluid Discretizer)", C.yel)
+          failCooldowns[entry.label] = nil
+          local craftable = getCraftable(entry)
+          if craftable then
+            if requestCraft(entry, craftable, deficit) then return false end
+            log("  ↓ Trying next priority...", C.yel)
+          else
+            log("⚠ No craftable pattern found for: " .. entry.label ..
+                " (check AE2 patterns & Fluid Discretizer)", C.yel)
+          end
         end
       end
     end
   end
 
-  log(allFull and "✓ All plasmas at target level!" or
-      "⚠ Some plasmas below target, but no crafts possible.",
-      allFull and C.grn or C.yel)
+  if allFull then
+    log("✓ All plasmas at target level!", C.grn)
+  elseif noCpuFree then
+    log(string.format("⏳ All crafting CPUs busy (%d/%d), waiting... ", busy, total), C.yel)
+  else
+    log("⚠ Some plasmas below target, but no crafts possible.", C.yel)
+  end
   return allFull
 end
 
