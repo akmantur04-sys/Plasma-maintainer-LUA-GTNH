@@ -18,23 +18,21 @@ end
 local CONFIG = {
   checkInterval   = 10,    -- seconds between stock checks
   idleSleepTime   = 60,    -- seconds to sleep when all targets met
-  verbose         = true,  -- detailed logging
+  verbose         = true,  -- show craft decisions below status bar
   craftTimeout    = 300,   -- seconds before craft is considered failed
   failCooldown    = 30,    -- seconds before retrying failed craft
   prioritizePower = true,  -- use strongest crafting CPU first
   cpuName         = nil,   -- specific crafting CPU name (nil = auto)
 }
 
--- Load stock list (external file required)
+-- Load stock list
 local ok, stockList = pcall(dofile, "/home/stockList.lua")
 if not ok or type(stockList) ~= "table" then
   print("ERROR: Could not load /home/stockList.lua")
   print("Create it with: return { {label='Helium Plasma', target=1000, batch=1, priority=100}, ... }")
   return
 end
-print("Loaded stockList.lua with " .. #stockList .. " entries.")
 
--- Sort by priority (highest first)
 table.sort(stockList, function(a, b) return (a.priority or 0) > (b.priority or 0) end)
 
 -- Terminal colors
@@ -50,18 +48,15 @@ local function log(msg, color)
 end
 
 local function fmtAmt(n)
-  if n >= 1e6 then return string.format("%.1fM mB", n / 1e6)
-  elseif n >= 1000 then return string.format("%.1fK mB", n / 1000)
-  else return string.format("%d mB", n) end
+  if n >= 1e6 then return string.format("%.1fM", n / 1e6)
+  elseif n >= 1000 then return string.format("%.1fK", n / 1000)
+  else return string.format("%d", n) end
 end
 
--- Label helpers: Fluid Discretizer uses "drop of X" for items, "X" for fluids
+-- Label helpers
 local function dropLabel(l)  return l:sub(1,8) == "drop of " and l or ("drop of " .. l) end
 local function cleanLabel(l) return l:sub(1,8) == "drop of " and l:sub(9) or l end
-
-local function matchLabel(label, target)
-  return target == label or target == cleanLabel(label) or target == dropLabel(label)
-end
+local function matchLabel(a, b) return b == a or b == cleanLabel(a) or b == dropLabel(a) end
 
 local function buildFilter(entry)
   local f = {}
@@ -70,17 +65,15 @@ local function buildFilter(entry)
   return f
 end
 
--- Query stored amount from ME network (tries fluids API first, then items)
+-- Query stored amount from ME (tries fluids first, then items)
 local function getStoredAmount(entry)
   local lClean, lDrop = cleanLabel(entry.label), dropLabel(entry.label)
-
   local ok, fluids = pcall(me.getFluidsInNetwork)
   if ok and fluids then
     for _, f in ipairs(fluids) do
       if f.label == lClean then return f.amount or 0 end
     end
   end
-
   local filter = buildFilter(entry)
   local items = me.getItemsInNetwork(next(filter) and filter or {label = lDrop})
   if items then
@@ -91,14 +84,11 @@ local function getStoredAmount(entry)
   return 0
 end
 
--- Find craftable object for entry
 local function getCraftable(entry)
   local lDrop = dropLabel(entry.label)
   local filter = buildFilter(entry)
-
   local craftables = me.getCraftables(next(filter) and filter or {label = lDrop})
   if not craftables or #craftables == 0 then craftables = me.getCraftables() end
-
   if craftables then
     for _, c in ipairs(craftables) do
       local s = c.getItemStack()
@@ -108,12 +98,7 @@ local function getCraftable(entry)
   return nil
 end
 
--- Craft tracking state
-local activeCraft = nil      -- { request, entry, startTime }
-local failCooldowns = {}     -- label -> timestamp
-local recentlyCrafted = {}   -- label -> true (cleared each cycle)
-
--- Get CPU status: total, busy count, and whether any are free
+-- CPU helpers
 local function getCpuInfo()
   local ok, cpus = pcall(me.getCpus)
   if not ok or not cpus then return 0, 0 end
@@ -122,12 +107,11 @@ local function getCpuInfo()
   return #cpus, busy
 end
 
-local function getCpuStatus()
-  local total, busy = getCpuInfo()
-  return string.format("CPUs: %d/%d busy", busy, total)
-end
+-- Craft tracking
+local activeCraft = nil
+local failCooldowns = {}
+local recentlyCrafted = {}
 
--- Clears activeCraft with logging and sets recentlyCrafted
 local function finishCraft(msg, color, setCooldown)
   local label = activeCraft.entry.label
   local elapsed = os.time() - activeCraft.startTime
@@ -135,7 +119,7 @@ local function finishCraft(msg, color, setCooldown)
   recentlyCrafted[label] = true
   if setCooldown then
     failCooldowns[label] = os.time() + CONFIG.failCooldown
-    log("  ⏸ Cooldown set: " .. CONFIG.failCooldown .. "s before retry", C.mag)
+    log("  ⏸ Cooldown: " .. CONFIG.failCooldown .. "s before retry", C.mag)
   end
   activeCraft = nil
 end
@@ -143,23 +127,18 @@ end
 local function isAnyCraftActive()
   if not activeCraft then return false end
   local req = activeCraft.request
-  local elapsed = os.time() - activeCraft.startTime
-
-  if req.isDone()     then finishCraft("✓ Craft done: ", C.grn, false)  return false end
-  if req.isCanceled() then finishCraft("✗ Craft canceled (by player or AE2): ", C.red, false) return false end
-  if req.hasFailed()  then finishCraft("✗ Craft failed (ingredients missing or unavailable): ", C.red, true) return false end
-
-  if elapsed > CONFIG.craftTimeout then
-    finishCraft("✗ Craft timeout (" .. CONFIG.craftTimeout .. "s limit): ", C.red, true)
+  if req.isDone()     then finishCraft("✓ Done: ", C.grn, false) return false end
+  if req.isCanceled() then finishCraft("✗ Canceled: ", C.red, false) return false end
+  if req.hasFailed()  then finishCraft("✗ Failed: ", C.red, true) return false end
+  if os.time() - activeCraft.startTime > CONFIG.craftTimeout then
+    finishCraft("✗ Timeout: ", C.red, true)
     return false
   end
   return true
 end
 
--- Check if AE2 is already crafting this item (our craft or external)
 local function isCraftAlreadyRunning(entry)
   if activeCraft and activeCraft.entry.label == entry.label then return true end
-
   local ok, cpus = pcall(me.getCpus)
   if ok and cpus then
     for _, cpu in ipairs(cpus) do
@@ -171,108 +150,172 @@ local function isCraftAlreadyRunning(entry)
   return false
 end
 
--- Request a craft from AE2
 local function requestCraft(entry, craftable, deficit)
   local amount = math.min(entry.batch or 1, deficit)
-  local cpuInfo = getCpuStatus()
-  log("→ Requesting craft: " .. amount .. "x " .. entry.label ..
-      " (Prio " .. (entry.priority or "?") .. ") [" .. cpuInfo .. "]", C.cyn)
+  local total, busy = getCpuInfo()
+  log("→ Craft: " .. amount .. "x " .. entry.label ..
+      " (P" .. (entry.priority or "?") .. ") [CPUs: " .. busy .. "/" .. total .. "]", C.cyn)
 
   local req = CONFIG.cpuName
     and craftable.request(amount, CONFIG.prioritizePower, CONFIG.cpuName)
     or  craftable.request(amount, CONFIG.prioritizePower)
 
   if not req then
-    log("✗ Craft request returned nil: " .. entry.label, C.red)
-    log("  Likely cause: AE2 internal error or broken pattern", C.red)
+    log("  ✗ Request returned nil (AE2 error or broken pattern)", C.red)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
 
-  os.sleep(0.5) -- let AE2 process
+  os.sleep(0.5)
 
   if req.hasFailed() then
-    -- CPUs were free (we checked above), so this is an actual ingredient problem
-    log("⚠ Craft failed: " .. entry.label .. " — missing ingredients or circular dependency", C.yel)
+    log("  ⚠ Failed: missing ingredients or circular dependency", C.yel)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
   if req.isCanceled() then
-    log("⚠ Craft canceled: " .. entry.label .. " — CPU may have been taken by another request", C.yel)
+    log("  ⚠ Canceled: CPU may have been taken", C.yel)
     failCooldowns[entry.label] = os.time() + CONFIG.failCooldown
     return false
   end
 
   activeCraft = { request = req, entry = entry, startTime = os.time() }
-  log("  ✓ Craft accepted, monitoring...", C.grn)
+  log("  ✓ Accepted, monitoring...", C.grn)
   return true
 end
 
--- Main check: iterate by priority, start one craft if needed
-local function checkAndMaintain()
-  if isAnyCraftActive() then
-    local elapsed = os.time() - activeCraft.startTime
-    log("⏳ Craft running: " .. activeCraft.entry.label ..
-        " (Prio " .. (activeCraft.entry.priority or "?") ..
-        ", " .. elapsed .. "s elapsed)", C.yel)
-    return false
-  end
+-- ============================================================
+-- DISPLAY: Compact status bar + craft decisions
+-- ============================================================
 
-  -- Early exit: check if any crafting CPU is free before scanning stock
-  local total, busy = getCpuInfo()
-  local noCpuFree = total > 0 and busy >= total
-
-  local allFull = true
+-- Collect all stock levels in one pass (returns table of {entry, stored, target, deficit})
+local function collectStatus()
+  local status = {}
   for _, entry in ipairs(stockList) do
     local stored = getStoredAmount(entry)
     local target = entry.target or 0
-    local deficit = target - stored
+    table.insert(status, {
+      entry   = entry,
+      stored  = stored,
+      target  = target,
+      deficit = target - stored,
+    })
+  end
+  return status
+end
 
-    if CONFIG.verbose then
-      local icon = stored >= target and "✓" or "✗"
-      local col  = stored >= target and C.grn or C.red
-      log(string.format("  %s [P%d] %-25s %s / %s", icon, entry.priority or 0,
-          entry.label, fmtAmt(stored), fmtAmt(target)), col)
+-- Print compact status bar: one line per plasma, colored
+local function printStatusBar(status, cpuTotal, cpuBusy)
+  term.clear()
+  print(C.cyn .. "══ PLASMA MAINTAINER ══" .. C.R ..
+        "  Entries: " .. #stockList ..
+        "  Interval: " .. CONFIG.checkInterval .. "s" ..
+        "  CPUs: " .. cpuBusy .. "/" .. cpuTotal)
+  print(string.rep("─", 60))
+
+  -- Compact grid: "Label: amount/target" with color
+  for _, s in ipairs(status) do
+    local pct = s.target > 0 and (s.stored / s.target * 100) or 100
+    local col = pct >= 100 and C.grn or (pct >= 50 and C.yel or C.red)
+    local bar = col .. string.format(" P%-3d %-22s %8s / %-8s",
+        s.entry.priority or 0, s.entry.label,
+        fmtAmt(s.stored), fmtAmt(s.target))
+
+    -- Show percentage or checkmark
+    if pct >= 100 then
+      bar = bar .. "  ✓"
+    else
+      bar = bar .. string.format(" %3d%%", pct)
     end
+    print(bar .. C.R)
+  end
 
-    if deficit > 0 then
-      allFull = false
+  print(string.rep("─", 60))
 
-      if not noCpuFree then
-        local cd = failCooldowns[entry.label]
-        if cd and os.time() < cd then
-          local remaining = cd - os.time()
-          log("  ⏸ Cooldown: " .. entry.label .. " (" .. remaining .. "s remaining)", C.mag)
-        elseif recentlyCrafted[entry.label] then
-          log("  ⏸ Waiting for stock update: " .. entry.label .. " (crafted this cycle)", C.mag)
-        elseif isCraftAlreadyRunning(entry) then
-          log("  ⏳ Already crafting on AE2 CPU: " .. entry.label, C.yel)
-        else
-          failCooldowns[entry.label] = nil
-          local craftable = getCraftable(entry)
-          if craftable then
-            if requestCraft(entry, craftable, deficit) then return false end
-            log("  ↓ Trying next priority...", C.yel)
-          else
-            log("⚠ No craftable pattern found for: " .. entry.label ..
-                " (check AE2 patterns & Fluid Discretizer)", C.yel)
-          end
-        end
-      end
-    end
+  -- Show active craft in header area
+  if activeCraft then
+    local elapsed = os.time() - activeCraft.startTime
+    print(C.cyn .. "⏳ Crafting: " .. activeCraft.entry.label ..
+          " (P" .. (activeCraft.entry.priority or "?") ..
+          ", " .. elapsed .. "s)" .. C.R)
+  end
+end
+
+-- ============================================================
+-- MAIN CHECK LOGIC
+-- ============================================================
+
+local function checkAndMaintain()
+  -- Check active craft status first
+  if isAnyCraftActive() then
+    return false  -- still crafting, status shown in header
+  end
+
+  -- Check CPU availability once
+  local cpuTotal, cpuBusy = getCpuInfo()
+  local noCpuFree = cpuTotal > 0 and cpuBusy >= cpuTotal
+
+  -- Collect all stock levels (one pass for display)
+  local status = collectStatus()
+
+  -- Display compact status bar
+  printStatusBar(status, cpuTotal, cpuBusy)
+
+  -- Determine if all full
+  local allFull = true
+  for _, s in ipairs(status) do
+    if s.deficit > 0 then allFull = false; break end
   end
 
   if allFull then
-    log("✓ All plasmas at target level!", C.grn)
-  elseif noCpuFree then
-    log(string.format("⏳ All crafting CPUs busy (%d/%d), waiting... ", busy, total), C.yel)
-  else
-    log("⚠ Some plasmas below target, but no crafts possible.", C.yel)
+    log("✓ All plasmas at target!", C.grn)
+    return true
   end
-  return allFull
+
+  if noCpuFree then
+    log("⏳ All CPUs busy (" .. cpuBusy .. "/" .. cpuTotal .. "), waiting...", C.yel)
+    return false
+  end
+
+  -- Try to start a craft (iterate by priority, already sorted)
+  for _, s in ipairs(status) do
+    if s.deficit <= 0 then goto next end
+
+    local label = s.entry.label
+    local cd = failCooldowns[label]
+    if cd and os.time() < cd then
+      log("  ⏸ Cooldown: " .. label .. " (" .. (cd - os.time()) .. "s)", C.mag)
+      goto next
+    end
+    if recentlyCrafted[label] then
+      log("  ⏸ Stock update pending: " .. label, C.mag)
+      goto next
+    end
+    if isCraftAlreadyRunning(s.entry) then
+      log("  ⏳ Already on CPU: " .. label, C.yel)
+      goto next
+    end
+
+    failCooldowns[label] = nil
+    local craftable = getCraftable(s.entry)
+    if craftable then
+      if requestCraft(s.entry, craftable, s.deficit) then return false end
+      log("  ↓ Next priority...", C.yel)
+    else
+      log("  ⚠ No pattern: " .. label, C.yel)
+    end
+
+    ::next::
+  end
+
+  log("⚠ Below target, but no crafts possible.", C.yel)
+  return false
 end
 
--- Scan mode: show all plasma items/fluids in ME network
+-- ============================================================
+-- SCAN MODE
+-- ============================================================
+
 local function scanMode()
   print(C.cyn .. "=== SCAN: Fluids & Drops in ME Network ===" .. C.R)
 
@@ -283,15 +326,12 @@ local function scanMode()
     local results = {}
     for _, v in ipairs(data) do if filterFn(v) then table.insert(results, v) end end
     table.sort(results, function(a, b) return (a.label or "") < (b.label or "") end)
-    if #results > 0 then
-      formatFn(results)
-    else
-      print("  No plasma entries found.")
-    end
+    if #results > 0 then formatFn(results)
+    else print("  No plasma entries found.") end
     return results
   end
 
-  local fluids = scanList("getFluidsInNetwork() (Direct fluid query)",
+  local fluids = scanList("getFluidsInNetwork()",
     me.getFluidsInNetwork,
     function(f) return string.find(string.lower(f.label or ""), "plasma") end,
     function(r)
@@ -302,14 +342,14 @@ local function scanMode()
       end
     end)
 
-  local drops = scanList('getItemsInNetwork() (Fluid drops via Discretizer)',
+  local drops = scanList("getItemsInNetwork()",
     me.getItemsInNetwork,
     function(i)
       local l = string.lower(i.label or "")
       return string.find(l, "plasma") and (string.find(l, "drop of") or string.find(i.name or "", "fluid_drop"))
     end,
     function(r)
-      print(string.format("  %-35s %-30s %-8s %-10s %-10s", "Label (for stockList)", "Name", "Damage", "Amount", "Craftable"))
+      print(string.format("  %-35s %-30s %-8s %-10s %-10s", "Label", "Name", "Dmg", "Amount", "Craft?"))
       print("  " .. string.rep("-", 95))
       for _, i in ipairs(r) do
         print(string.format("  %-35s %-30s %-8d %-10s %-10s", i.label or "?", i.name or "?",
@@ -317,50 +357,42 @@ local function scanMode()
       end
     end)
 
-  print("\n" .. C.cyn .. "=== NOTE ===" .. C.R)
-  print('Both label formats work: "Helium Plasma" or "drop of Helium Plasma"')
-  print("Amounts are in mB (1000 mB = 1 bucket).")
+  print("\n" .. C.cyn .. "NOTE: " .. C.R .. 'Both "Helium Plasma" and "drop of Helium Plasma" work.')
+  print("Amounts in mB (1000 = 1 bucket).")
   if #fluids == 0 and #drops == 0 then
-    print(C.red .. "\nWARNING: No plasmas found! Check Discretizer/adapter/storage." .. C.R)
+    print(C.red .. "WARNING: No plasmas found! Check Discretizer/adapter/storage." .. C.R)
   end
 end
 
--- CLI argument handling
+-- ============================================================
+-- CLI & MAIN LOOP
+-- ============================================================
+
 local args = {...}
 if args[1] == "scan" then scanMode(); return end
 if args[1] == "help" then
   print("Plasma Priority Maintainer for GTNH\n")
-  print("Usage:")
-  print("  plasma_maintainer        - Start the maintainer")
-  print("  plasma_maintainer scan   - Show all plasma items in ME")
-  print("  plasma_maintainer help   - This help\n")
-  print("Config: Edit CONFIG table in script. Plasma list: /home/stockList.lua")
+  print("  plasma_maintainer        Start maintainer")
+  print("  plasma_maintainer scan   Show plasma items in ME")
+  print("  plasma_maintainer help   This help\n")
+  print("Config: CONFIG table in script. Plasmas: /home/stockList.lua")
   print('Format: return { {label="Helium Plasma", target=1000, batch=1, priority=100}, ... }')
   return
 end
 
--- Main loop
 print(C.grn .. "Starting Plasma Priority Maintainer..." .. C.R)
-print(C.yel .. "Press Ctrl+C to stop." .. C.R .. "\n")
+print(C.yel .. "Press Ctrl+C to stop.\n" .. C.R)
 local running = true
 event.listen("interrupted", function() running = false end)
 
 while running do
   recentlyCrafted = {}
   local allFull = false
-  local ok, err = pcall(function()
-    term.clear()
-    print(C.cyn .. "╔══════════════════════════════════════════════════╗")
-    print("║       PLASMA PRIORITY MAINTAINER v1.0            ║")
-    print("╚══════════════════════════════════════════════════╝" .. C.R .. "\n")
-    print(C.yel .. "Entries: " .. #stockList .. " | Interval: " .. CONFIG.checkInterval .. "s" .. C.R)
-    print(string.rep("─", 55))
-    allFull = checkAndMaintain()
-  end)
+  local ok, err = pcall(function() allFull = checkAndMaintain() end)
   if not ok then log("ERROR: " .. tostring(err), C.red) end
 
   local sleepTime = allFull and CONFIG.idleSleepTime or CONFIG.checkInterval
-  if allFull then log("💤 All full, sleeping " .. sleepTime .. "s...", C.grn) end
+  if allFull then log("💤 Sleeping " .. sleepTime .. "s...", C.grn) end
 
   local slept = 0
   while slept < sleepTime and running do
