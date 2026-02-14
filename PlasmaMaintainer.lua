@@ -19,7 +19,7 @@ local CONFIG = {
   checkInterval   = 10,    -- seconds between stock checks
   idleSleepTime   = 60,    -- seconds to sleep when all targets met
   verbose         = true,  -- show craft decisions below status bar
-  craftTimeout    = 300,   -- seconds before craft is considered failed
+  craftTimeout    = 3600,  -- seconds before timeout warning (0 = disabled)
   failCooldown    = 30,    -- seconds before retrying failed craft
   prioritizePower = true,  -- use strongest crafting CPU first
   cpuName         = nil,   -- specific crafting CPU name (nil = auto)
@@ -107,38 +107,27 @@ local function getCpuInfo()
   return #cpus, busy
 end
 
--- Craft tracking
-local activeCraft = nil
+-- Craft tracking: label -> { request, entry, startTime }
+local activeCrafts = {}
 local failCooldowns = {}
 local recentlyCrafted = {}
 
-local function finishCraft(msg, color, setCooldown)
-  local label = activeCraft.entry.label
-  local elapsed = os.time() - activeCraft.startTime
-  log(msg .. label .. " (after " .. elapsed .. "s)", color)
+local function finishCraft(label, msg, color, setCooldown)
+  local craft = activeCrafts[label]
+  if not craft then return end
+  local elapsed = os.time() - craft.startTime
+  log(msg .. label .. " (after " .. string.format("%.0f", elapsed) .. "s)", color)
   recentlyCrafted[label] = true
   if setCooldown then
     failCooldowns[label] = os.time() + CONFIG.failCooldown
     log("  ⏸ Cooldown: " .. CONFIG.failCooldown .. "s before retry", C.mag)
   end
-  activeCraft = nil
+  activeCrafts[label] = nil
 end
 
-local function isAnyCraftActive()
-  if not activeCraft then return false end
-  local req = activeCraft.request
-  if req.isDone()     then finishCraft("✓ Done: ", C.grn, false) return false end
-  if req.isCanceled() then finishCraft("✗ Canceled: ", C.red, false) return false end
-  if req.hasFailed()  then finishCraft("✗ Failed: ", C.red, true) return false end
-  if os.time() - activeCraft.startTime > CONFIG.craftTimeout then
-    finishCraft("✗ Timeout: ", C.red, true)
-    return false
-  end
-  return true
-end
-
+-- Check if AE2 is already crafting this item (our craft or external)
 local function isCraftAlreadyRunning(entry)
-  if activeCraft and activeCraft.entry.label == entry.label then return true end
+  if activeCrafts[entry.label] then return true end
   local ok, cpus = pcall(me.getCpus)
   if ok and cpus then
     for _, cpu in ipairs(cpus) do
@@ -150,10 +139,37 @@ local function isCraftAlreadyRunning(entry)
   return false
 end
 
+-- Update all active crafts: check status, clean up finished ones
+local function updateActiveCrafts()
+  for label, craft in pairs(activeCrafts) do
+    local req = craft.request
+    if req.isDone()     then finishCraft(label, "✓ Done: ", C.grn, false)
+    elseif req.isCanceled() then finishCraft(label, "✗ Canceled: ", C.red, false)
+    elseif req.hasFailed()  then finishCraft(label, "✗ Failed: ", C.red, true)
+    elseif CONFIG.craftTimeout > 0 and os.time() - craft.startTime > CONFIG.craftTimeout then
+      if isCraftAlreadyRunning(craft.entry) then
+        local elapsed = os.time() - craft.startTime
+        if elapsed % 60 < CONFIG.checkInterval then
+          log("⚠ Exceeds timeout but still on CPU: " .. label ..
+              " (" .. string.format("%.0f", elapsed) .. "s)", C.yel)
+        end
+      else
+        finishCraft(label, "✗ Timeout (craft lost): ", C.red, true)
+      end
+    end
+  end
+end
+
+local function countActiveCrafts()
+  local n = 0
+  for _ in pairs(activeCrafts) do n = n + 1 end
+  return n
+end
+
 local function requestCraft(entry, craftable, deficit)
   local amount = math.min(entry.batch or 1, deficit)
   local total, busy = getCpuInfo()
-  log("→ Craft: " .. amount .. "x " .. entry.label ..
+  log("→ Craft: " .. fmtAmt(amount) .. "x " .. entry.label ..
       " (P" .. (entry.priority or "?") .. ") [CPUs: " .. busy .. "/" .. total .. "]", C.cyn)
 
   local req = CONFIG.cpuName
@@ -179,7 +195,7 @@ local function requestCraft(entry, craftable, deficit)
     return false
   end
 
-  activeCraft = { request = req, entry = entry, startTime = os.time() }
+  activeCrafts[entry.label] = { request = req, entry = entry, startTime = os.time() }
   log("  ✓ Accepted, monitoring...", C.grn)
   return true
 end
@@ -232,12 +248,12 @@ local function printStatusBar(status, cpuTotal, cpuBusy)
 
   print(string.rep("─", 60))
 
-  -- Show active craft in header area
-  if activeCraft then
-    local elapsed = os.time() - activeCraft.startTime
-    print(C.cyn .. "⏳ Crafting: " .. activeCraft.entry.label ..
-          " (P" .. (activeCraft.entry.priority or "?") ..
-          ", " .. elapsed .. "s)" .. C.R)
+  -- Show active crafts in header area
+  for label, craft in pairs(activeCrafts) do
+    local elapsed = os.time() - craft.startTime
+    print(C.cyn .. "⏳ Crafting: " .. label ..
+          " (P" .. (craft.entry.priority or "?") ..
+          ", " .. string.format("%.0f", elapsed) .. "s)" .. C.R)
   end
 end
 
@@ -246,14 +262,12 @@ end
 -- ============================================================
 
 local function checkAndMaintain()
-  -- Check active craft status first
-  if isAnyCraftActive() then
-    return false  -- still crafting, status shown in header
-  end
+  -- Update all active crafts (check done/failed/canceled)
+  updateActiveCrafts()
 
-  -- Check CPU availability once
+  -- Check CPU availability
   local cpuTotal, cpuBusy = getCpuInfo()
-  local noCpuFree = cpuTotal > 0 and cpuBusy >= cpuTotal
+  local cpuFree = cpuTotal - cpuBusy
 
   -- Collect all stock levels (one pass for display)
   local status = collectStatus()
@@ -272,19 +286,21 @@ local function checkAndMaintain()
     return true
   end
 
-  if noCpuFree then
+  if cpuFree <= 0 then
     log("⏳ All CPUs busy (" .. cpuBusy .. "/" .. cpuTotal .. "), waiting...", C.yel)
     return false
   end
 
-  -- Try to start a craft (iterate by priority, already sorted)
+  -- Try to start crafts for free CPUs (iterate by priority)
+  local craftsStarted = 0
   for _, s in ipairs(status) do
+    if cpuFree <= 0 then break end  -- no more free CPUs
     if s.deficit <= 0 then goto next end
 
     local label = s.entry.label
     local cd = failCooldowns[label]
     if cd and os.time() < cd then
-      log("  ⏸ Cooldown: " .. label .. " (" .. (cd - os.time()) .. "s)", C.mag)
+      log("  ⏸ Cooldown: " .. label .. " (" .. string.format("%.0f", cd - os.time()) .. "s)", C.mag)
       goto next
     end
     if recentlyCrafted[label] then
@@ -299,8 +315,12 @@ local function checkAndMaintain()
     failCooldowns[label] = nil
     local craftable = getCraftable(s.entry)
     if craftable then
-      if requestCraft(s.entry, craftable, s.deficit) then return false end
-      log("  ↓ Next priority...", C.yel)
+      if requestCraft(s.entry, craftable, s.deficit) then
+        craftsStarted = craftsStarted + 1
+        cpuFree = cpuFree - 1
+      else
+        log("  ↓ Next priority...", C.yel)
+      end
     else
       log("  ⚠ No pattern: " .. label, C.yel)
     end
@@ -308,7 +328,9 @@ local function checkAndMaintain()
     ::next::
   end
 
-  log("⚠ Below target, but no crafts possible.", C.yel)
+  if craftsStarted == 0 and countActiveCrafts() == 0 then
+    log("⚠ Below target, but no crafts possible.", C.yel)
+  end
   return false
 end
 
@@ -398,7 +420,7 @@ while running do
   while slept < sleepTime and running do
     os.sleep(1)
     slept = slept + 1
-    if activeCraft then isAnyCraftActive() end
+    if next(activeCrafts) then updateActiveCrafts() end
   end
 end
 
